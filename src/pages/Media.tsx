@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Play, Image, Headphones, ShoppingBag, Heart, Share2, MessageCircle, Eye, Filter, Search, Star, Download, Rss } from 'lucide-react';
+import { Play, Image, Headphones, ShoppingBag, Heart, Share2, MessageCircle, Eye, Filter, Search, Star, Download, Rss, ChevronDown } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../lib/supabase';
 
@@ -26,6 +26,19 @@ interface MediaItem {
   is_following?: boolean;
 }
 
+const ITEMS_PER_PAGE = 12;
+const SELECTED_FIELDS = 'id,title,creator_name,thumbnail_url,duration,read_time,category,type,content_type,description,price,rating,is_premium,views_count,plays_count,sales_count,likes_count';
+
+interface CacheEntry {
+  data: MediaItem[];
+  timestamp: number;
+  userLikes: Set<string>;
+  userFollows: Set<string>;
+}
+
+const cache = new Map<string, CacheEntry>();
+const CACHE_DURATION = 5 * 60 * 1000;
+
 export default function Media() {
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -35,7 +48,11 @@ export default function Media() {
   const [mediaContent, setMediaContent] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalItems, setTotalItems] = useState(0);
   const fetchInProgressRef = useRef(false);
+  const userLikesCache = useRef<Map<string, Set<string>>>(new Map());
+  const userFollowsCache = useRef<Map<string, Set<string>>>(new Map());
 
   const categories = {
     stream: ['all', 'movie', 'music-video', 'documentaries', 'lifestyle', 'Go Live'],
@@ -45,114 +62,111 @@ export default function Media() {
     resources: ['all', 'templates', 'ebooks', 'software', 'presets']
   };
 
-  const tabs = [
+  const tabs = useMemo(() => [
     { id: 'stream', label: 'Stream', icon: <Play className="w-5 h-5" /> },
     { id: 'listen', label: 'Listen', icon: <Headphones className="w-5 h-5" /> },
     { id: 'blog', label: 'Blog', icon: <Rss className="w-5 h-5" /> },
     { id: 'gallery', label: 'Gallery', icon: <Image className="w-5 h-5" /> },
     { id: 'resources', label: 'Resources', icon: <ShoppingBag className="w-5 h-5" /> }
-  ];
+  ], []);
 
-  useEffect(() => {
-    fetchMediaContent();
-  }, [activeTab, user]);
+  const fetchUserInteractions = useCallback(async (userId: string): Promise<{ likes: Set<string>; follows: Set<string> }> => {
+    try {
+      const cachedLikes = userLikesCache.current.get(userId);
+      const cachedFollows = userFollowsCache.current.get(userId);
 
-  useEffect(() => {
-    if (!user) return;
+      if (cachedLikes && cachedFollows) {
+        return { likes: cachedLikes, follows: cachedFollows };
+      }
 
-    const likesSubscription = supabase
-      .channel(`media_likes_changes_${activeTab}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'media_likes' }, () => {
-        if (!fetchInProgressRef.current) {
-          fetchMediaContent();
-        }
-      })
-      .subscribe();
+      const [{ data: userLikesData }, { data: userFollowsData }] = await Promise.all([
+        supabase.from('media_likes').select('media_id').eq('user_id', userId),
+        supabase.from('creator_follows').select('creator_name').eq('follower_id', userId)
+      ]);
 
-    const followsSubscription = supabase
-      .channel(`creator_follows_changes_${activeTab}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'creator_follows' }, () => {
-        if (!fetchInProgressRef.current) {
-          fetchMediaContent();
-        }
-      })
-      .subscribe();
+      const likes = new Set((userLikesData || []).map(l => l.media_id));
+      const follows = new Set((userFollowsData || []).map(f => f.creator_name));
 
-    return () => {
-      likesSubscription.unsubscribe();
-      followsSubscription.unsubscribe();
-    };
-  }, [user, activeTab]);
+      userLikesCache.current.set(userId, likes);
+      userFollowsCache.current.set(userId, follows);
 
-  const fetchMediaContent = async () => {
-    if (fetchInProgressRef.current) {
-      return;
+      return { likes, follows };
+    } catch (error) {
+      console.error('Error fetching user interactions:', error);
+      return { likes: new Set(), follows: new Set() };
     }
+  }, []);
 
+  const fetchMediaContent = useCallback(async () => {
+    if (fetchInProgressRef.current) return;
     fetchInProgressRef.current = true;
     setLoading(true);
     setError(null);
 
     try {
-      const { data: mediaData, error: mediaError } = await supabase
-        .from('media_content')
-        .select('*')
-        .eq('type', activeTab)
-        .order('created_at', { ascending: false });
+      const cacheKey = `${activeTab}-${selectedCategory}-${searchQuery}`;
+      const cachedEntry = cache.get(cacheKey);
+      const now = Date.now();
 
-      if (mediaError) throw mediaError;
+      const buildQuery = () => {
+        let query = supabase.from('media_content').select(SELECTED_FIELDS, { count: 'exact' }).eq('type', activeTab);
 
-      if (mediaData && mediaData.length > 0) {
-        const { data: allLikes, error: likesError } = await supabase
-          .from('media_likes')
-          .select('media_id');
-
-        if (likesError) {
-          console.error('Error fetching likes:', likesError);
+        if (selectedCategory !== 'all') {
+          query = query.eq('category', selectedCategory);
         }
 
-        let userLikes: any[] = [];
-        let userFollows: any[] = [];
-
-        if (user) {
-          const { data: userLikesData, error: userLikesError } = await supabase
-            .from('media_likes')
-            .select('media_id')
-            .eq('user_id', user.id);
-
-          if (!userLikesError) {
-            userLikes = userLikesData || [];
-          }
-
-          const { data: userFollowsData, error: userFollowsError } = await supabase
-            .from('creator_follows')
-            .select('creator_name')
-            .eq('follower_id', user.id);
-
-          if (!userFollowsError) {
-            userFollows = userFollowsData || [];
-          }
+        if (searchQuery) {
+          query = query.or(`title.ilike.%${searchQuery}%,creator_name.ilike.%${searchQuery}%`);
         }
 
-        const likesCountMap = new Map<string, number>();
-        (allLikes || []).forEach((like) => {
-          const count = likesCountMap.get(like.media_id) || 0;
-          likesCountMap.set(like.media_id, count + 1);
-        });
+        return query.order('created_at', { ascending: false });
+      };
 
-        const userLikesSet = new Set((userLikes || []).map(l => l.media_id));
-        const userFollowsSet = new Set((userFollows || []).map(f => f.creator_name));
-
-        const enrichedData = (mediaData || []).map((item) => ({
-          ...item,
-          likes_count: likesCountMap.get(item.id) || item.likes_count || 0,
-          is_liked: userLikesSet.has(item.id),
-          is_following: userFollowsSet.has(item.creator_name),
-        }));
-
-        setMediaContent(enrichedData);
+      if (cachedEntry && now - cachedEntry.timestamp < CACHE_DURATION && !user) {
+        const startIdx = (currentPage - 1) * ITEMS_PER_PAGE;
+        const endIdx = startIdx + ITEMS_PER_PAGE;
+        const paginatedData = cachedEntry.data.slice(startIdx, endIdx);
+        setMediaContent(paginatedData);
+        setTotalItems(cachedEntry.data.length);
       } else {
-        setMediaContent([]);
+        const startIdx = (currentPage - 1) * ITEMS_PER_PAGE;
+        const { data: mediaData, error: mediaError, count } = await buildQuery()
+          .range(startIdx, startIdx + ITEMS_PER_PAGE - 1);
+
+        if (mediaError) throw mediaError;
+
+        if (mediaData && mediaData.length > 0) {
+          let userLikes = new Set<string>();
+          let userFollows = new Set<string>();
+
+          if (user) {
+            const interactions = await fetchUserInteractions(user.id);
+            userLikes = interactions.likes;
+            userFollows = interactions.follows;
+          }
+
+          const enrichedData = (mediaData || []).map((item) => ({
+            ...item,
+            likes_count: item.likes_count || 0,
+            is_liked: userLikes.has(item.id),
+            is_following: userFollows.has(item.creator_name),
+          }));
+
+          setMediaContent(enrichedData);
+          setTotalItems(count || 0);
+
+          if (!user) {
+            cache.set(cacheKey, {
+              data: enrichedData,
+              timestamp: now,
+              userLikes,
+              userFollows,
+            });
+          }
+        } else {
+          setMediaContent([]);
+          setTotalItems(0);
+        }
       }
     } catch (error) {
       console.error('Error fetching media:', error);
@@ -162,9 +176,46 @@ export default function Media() {
       fetchInProgressRef.current = false;
       setLoading(false);
     }
-  };
+  }, [activeTab, selectedCategory, searchQuery, currentPage, user, fetchUserInteractions]);
 
-  const handleLike = async (mediaId: string) => {
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeTab, selectedCategory]);
+
+  useEffect(() => {
+    fetchMediaContent();
+  }, [activeTab, user, currentPage, fetchMediaContent]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const likesSubscription = supabase
+      .channel(`media_likes_${activeTab}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'media_likes' }, () => {
+        if (!fetchInProgressRef.current) {
+          userLikesCache.current.delete(user.id);
+          fetchMediaContent();
+        }
+      })
+      .subscribe();
+
+    const followsSubscription = supabase
+      .channel(`creator_follows_${activeTab}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'creator_follows' }, () => {
+        if (!fetchInProgressRef.current) {
+          userFollowsCache.current.delete(user.id);
+          fetchMediaContent();
+        }
+      })
+      .subscribe();
+
+    return () => {
+      likesSubscription.unsubscribe();
+      followsSubscription.unsubscribe();
+    };
+  }, [user, activeTab, fetchMediaContent]);
+
+  const handleLike = useCallback(async (mediaId: string) => {
     if (!user) {
       alert('Please sign in to like content.');
       navigate('/signin');
@@ -210,19 +261,16 @@ export default function Media() {
       setMediaContent(previousContent);
       setError('Failed to update like. Please try again.');
     }
-  };
+  }, [user, mediaContent, navigate]);
 
-  const handleFollow = async (creatorName: string) => {
+  const handleFollow = useCallback(async (creatorName: string) => {
     if (!user) {
       alert('Please sign in to follow creators.');
       navigate('/signin');
       return;
     }
 
-    const item = mediaContent.find((m) => m.creator_name === creatorName);
-    if (!item) return;
-
-    const wasFollowing = item.is_following;
+    const wasFollowing = mediaContent.some(m => m.creator_name === creatorName && m.is_following);
     const previousContent = mediaContent;
 
     try {
@@ -254,26 +302,30 @@ export default function Media() {
       setMediaContent(previousContent);
       setError('Failed to update follow status. Please try again.');
     }
-  };
+  }, [user, mediaContent, navigate]);
 
-  const handleSubscribe = () => {
+  const handleSubscribe = useCallback(() => {
     if (!user) {
       alert('Please sign in to subscribe.');
       navigate('/signin');
       return;
     }
     alert('Premium subscription activated! Enjoy exclusive content.');
-  };
+  }, [user, navigate]);
 
-  const filteredContent = mediaContent.filter((item) => {
-    const matchesCategory = selectedCategory === 'all' || item.category === selectedCategory;
-    const matchesSearch =
-      item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.creator_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.description?.toLowerCase().includes(searchQuery.toLowerCase());
+  const filteredContent = useMemo(() => {
+    return mediaContent.filter((item) => {
+      const matchesCategory = selectedCategory === 'all' || item.category === selectedCategory;
+      const matchesSearch =
+        item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        item.creator_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (item.description?.toLowerCase().includes(searchQuery.toLowerCase()) ?? false);
 
-    return matchesCategory && matchesSearch;
-  });
+      return matchesCategory && matchesSearch;
+    });
+  }, [mediaContent, selectedCategory, searchQuery]);
+
+  const totalPages = Math.ceil(totalItems / ITEMS_PER_PAGE);
 
   return (
     <div className="min-h-screen pt-20 pb-12 px-4">
@@ -349,140 +401,59 @@ export default function Media() {
             <p className="text-gray-400 mt-4">Loading content...</p>
           </div>
         ) : (
-          <div className="grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-            {filteredContent.map((item) => (
-              <div key={item.id} className="glass-effect rounded-2xl overflow-hidden hover-lift group">
-                <div className="relative aspect-video bg-gray-800">
-                  <img
-                    src={item.thumbnail_url}
-                    alt={item.title}
-                    className="w-full h-full object-cover"
-                  />
+          <>
+            <div className="grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+              {filteredContent.map((item) => (
+                <MediaCard
+                  key={item.id}
+                  item={item}
+                  activeTab={activeTab}
+                  onLike={handleLike}
+                  onFollow={handleFollow}
+                  onSubscribe={handleSubscribe}
+                  user={user}
+                />
+              ))}
+            </div>
 
-                  <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                    {activeTab === 'stream' && <Play className="w-12 h-12 text-white" />}
-                    {activeTab === 'listen' && <Headphones className="w-12 h-12 text-white" />}
-                    {activeTab === 'blog' && <Rss className="w-12 h-12 text-white" />}
-                    {activeTab === 'resources' && <ShoppingBag className="w-12 h-12 text-white" />}
-                  </div>
-
-                  {item.is_premium && (
-                    <div className="absolute top-2 right-2 px-2 py-1 bg-gradient-to-r from-yellow-400 to-orange-500 text-black text-xs font-bold rounded-full">
-                      PREMIUM
-                    </div>
-                  )}
-
-                  {(activeTab === 'stream' || activeTab === 'listen') && item.duration && (
-                    <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/70 text-white text-xs rounded">
-                      {item.duration}
-                    </div>
-                  )}
-                  {activeTab === 'blog' && item.read_time && (
-                    <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/70 text-white text-xs rounded">
-                      {item.read_time}
-                    </div>
-                  )}
-                </div>
-
-                <div className="p-4">
-                  <h3 className="text-white font-semibold mb-2 line-clamp-2">{item.title}</h3>
-                  <p className="text-gray-400 text-sm mb-3">{item.creator_name}</p>
-
-                  <div className="flex items-center justify-between text-sm text-gray-400 mb-4">
-                    {activeTab === 'stream' && (
-                      <>
-                        <div className="flex items-center space-x-1">
-                          <Eye className="w-4 h-4" />
-                          <span>{item.views_count.toLocaleString()}</span>
-                        </div>
-                        <div className="flex items-center space-x-1">
-                          <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-rose-400 text-rose-400' : ''}`} />
-                          <span>{item.likes_count || 0}</span>
-                        </div>
-                      </>
-                    )}
-                    {activeTab === 'listen' && (
-                      <div className="flex items-center space-x-1">
-                        <Play className="w-4 h-4" />
-                        <span>{item.plays_count.toLocaleString()} plays</span>
-                      </div>
-                    )}
-                    {activeTab === 'blog' && (
-                      <div className="flex items-center space-x-1">
-                        <MessageCircle className="w-4 h-4" />
-                        <span>{item.views_count}</span>
-                      </div>
-                    )}
-                    {activeTab === 'gallery' && (
-                      <div className="flex items-center space-x-1">
-                        <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-rose-400 text-rose-400' : ''}`} />
-                        <span>{item.likes_count || 0}</span>
-                      </div>
-                    )}
-
-                    {activeTab === 'resources' && (
-                      <>
-                        <div className="flex items-center space-x-1">
-                          <Star className="w-4 h-4 text-yellow-400" />
-                          <span>{item.rating.toFixed(1)}</span>
-                        </div>
-                        <div className="text-rose-400 font-bold">UGX {item.price?.toLocaleString()}</div>
-                      </>
-                    )}
-                  </div>
-
-                  <div className="flex space-x-2">
-                    {activeTab === 'resources' ? (
-                      <>
-                        <button className="flex-1 py-2 bg-gradient-to-r from-rose-500 to-purple-600 text-white rounded-lg hover:shadow-lg transition-all text-sm font-medium">
-                          Buy Now
-                        </button>
-                        <button className="p-2 glass-effect text-gray-400 hover:text-white rounded-lg transition-colors">
-                          <Download className="w-4 h-4" />
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          onClick={() => handleFollow(item.creator_name)}
-                          className={`flex-1 py-2 rounded-lg hover:shadow-lg transition-all text-sm font-medium ${
-                            item.is_following
-                              ? 'bg-gray-600 text-white'
-                              : 'bg-gradient-to-r from-rose-500 to-purple-600 text-white'
-                          }`}
-                        >
-                          {item.is_following ? 'Following' : 'Follow'}
-                        </button>
-                        <button
-                          onClick={() => handleLike(item.id)}
-                          className={`p-2 glass-effect rounded-lg transition-colors ${
-                            item.is_liked ? 'text-rose-400' : 'text-gray-400 hover:text-white'
-                          }`}
-                        >
-                          <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-current' : ''}`} />
-                        </button>
-                        <button className="p-2 glass-effect text-gray-400 hover:text-white rounded-lg transition-colors">
-                          <Share2 className="w-4 h-4" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-
-                  {item.is_premium && user?.tier === 'free' && (
-                    <div className="mt-3 p-3 bg-gradient-to-r from-yellow-400/20 to-orange-500/20 border border-yellow-400/30 rounded-lg">
-                      <p className="text-yellow-400 text-xs mb-2">Premium content - Subscribe to unlock</p>
+            {totalPages > 1 && (
+              <div className="mt-8 flex justify-center items-center gap-2">
+                <button
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                  disabled={currentPage === 1}
+                  className="px-4 py-2 glass-effect rounded-lg text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-white/10 transition-colors"
+                >
+                  Previous
+                </button>
+                <div className="flex gap-1">
+                  {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                    const pageNum = Math.max(1, currentPage - 2) + i;
+                    if (pageNum > totalPages) return null;
+                    return (
                       <button
-                        onClick={handleSubscribe}
-                        className="w-full py-1 bg-gradient-to-r from-yellow-400 to-orange-500 text-black text-xs font-bold rounded"
+                        key={pageNum}
+                        onClick={() => setCurrentPage(pageNum)}
+                        className={`px-3 py-2 rounded-lg transition-all ${
+                          currentPage === pageNum
+                            ? 'bg-gradient-to-r from-rose-500 to-purple-600 text-white'
+                            : 'glass-effect text-gray-300 hover:text-white'
+                        }`}
                       >
-                        Subscribe Now
+                        {pageNum}
                       </button>
-                    </div>
-                  )}
+                    );
+                  })}
                 </div>
+                <button
+                  onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                  disabled={currentPage === totalPages}
+                  className="px-4 py-2 glass-effect rounded-lg text-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-white/10 transition-colors"
+                >
+                  Next
+                </button>
               </div>
-            ))}
-          </div>
+            )}
+          </>
         )}
 
         {!loading && filteredContent.length === 0 && (
@@ -502,3 +473,156 @@ export default function Media() {
     </div>
   );
 }
+
+interface MediaCardProps {
+  item: MediaItem;
+  activeTab: string;
+  onLike: (id: string) => void;
+  onFollow: (name: string) => void;
+  onSubscribe: () => void;
+  user: any;
+}
+
+const MediaCard = ({ item, activeTab, onLike, onFollow, onSubscribe, user }: MediaCardProps) => {
+  const [imageLoaded, setImageLoaded] = useState(false);
+
+  return (
+    <div className="glass-effect rounded-2xl overflow-hidden hover-lift group">
+      <div className="relative aspect-video bg-gray-800">
+        <img
+          src={item.thumbnail_url}
+          alt={item.title}
+          loading="lazy"
+          onLoad={() => setImageLoaded(true)}
+          className={`w-full h-full object-cover transition-opacity duration-300 ${
+            imageLoaded ? 'opacity-100' : 'opacity-0'
+          }`}
+        />
+        {!imageLoaded && (
+          <div className="absolute inset-0 bg-gradient-to-r from-gray-800 to-gray-700 animate-pulse" />
+        )}
+
+        <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+          {activeTab === 'stream' && <Play className="w-12 h-12 text-white" />}
+          {activeTab === 'listen' && <Headphones className="w-12 h-12 text-white" />}
+          {activeTab === 'blog' && <Rss className="w-12 h-12 text-white" />}
+          {activeTab === 'resources' && <ShoppingBag className="w-12 h-12 text-white" />}
+        </div>
+
+        {item.is_premium && (
+          <div className="absolute top-2 right-2 px-2 py-1 bg-gradient-to-r from-yellow-400 to-orange-500 text-black text-xs font-bold rounded-full">
+            PREMIUM
+          </div>
+        )}
+
+        {(activeTab === 'stream' || activeTab === 'listen') && item.duration && (
+          <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/70 text-white text-xs rounded">
+            {item.duration}
+          </div>
+        )}
+        {activeTab === 'blog' && item.read_time && (
+          <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/70 text-white text-xs rounded">
+            {item.read_time}
+          </div>
+        )}
+      </div>
+
+      <div className="p-4">
+        <h3 className="text-white font-semibold mb-2 line-clamp-2">{item.title}</h3>
+        <p className="text-gray-400 text-sm mb-3">{item.creator_name}</p>
+
+        <div className="flex items-center justify-between text-sm text-gray-400 mb-4">
+          {activeTab === 'stream' && (
+            <>
+              <div className="flex items-center space-x-1">
+                <Eye className="w-4 h-4" />
+                <span>{item.views_count.toLocaleString()}</span>
+              </div>
+              <div className="flex items-center space-x-1">
+                <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-rose-400 text-rose-400' : ''}`} />
+                <span>{item.likes_count || 0}</span>
+              </div>
+            </>
+          )}
+          {activeTab === 'listen' && (
+            <div className="flex items-center space-x-1">
+              <Play className="w-4 h-4" />
+              <span>{item.plays_count.toLocaleString()} plays</span>
+            </div>
+          )}
+          {activeTab === 'blog' && (
+            <div className="flex items-center space-x-1">
+              <MessageCircle className="w-4 h-4" />
+              <span>{item.views_count}</span>
+            </div>
+          )}
+          {activeTab === 'gallery' && (
+            <div className="flex items-center space-x-1">
+              <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-rose-400 text-rose-400' : ''}`} />
+              <span>{item.likes_count || 0}</span>
+            </div>
+          )}
+
+          {activeTab === 'resources' && (
+            <>
+              <div className="flex items-center space-x-1">
+                <Star className="w-4 h-4 text-yellow-400" />
+                <span>{item.rating.toFixed(1)}</span>
+              </div>
+              <div className="text-rose-400 font-bold">UGX {item.price?.toLocaleString()}</div>
+            </>
+          )}
+        </div>
+
+        <div className="flex space-x-2">
+          {activeTab === 'resources' ? (
+            <>
+              <button className="flex-1 py-2 bg-gradient-to-r from-rose-500 to-purple-600 text-white rounded-lg hover:shadow-lg transition-all text-sm font-medium">
+                Buy Now
+              </button>
+              <button className="p-2 glass-effect text-gray-400 hover:text-white rounded-lg transition-colors">
+                <Download className="w-4 h-4" />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => onFollow(item.creator_name)}
+                className={`flex-1 py-2 rounded-lg hover:shadow-lg transition-all text-sm font-medium ${
+                  item.is_following
+                    ? 'bg-gray-600 text-white'
+                    : 'bg-gradient-to-r from-rose-500 to-purple-600 text-white'
+                }`}
+              >
+                {item.is_following ? 'Following' : 'Follow'}
+              </button>
+              <button
+                onClick={() => onLike(item.id)}
+                className={`p-2 glass-effect rounded-lg transition-colors ${
+                  item.is_liked ? 'text-rose-400' : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <Heart className={`w-4 h-4 ${item.is_liked ? 'fill-current' : ''}`} />
+              </button>
+              <button className="p-2 glass-effect text-gray-400 hover:text-white rounded-lg transition-colors">
+                <Share2 className="w-4 h-4" />
+              </button>
+            </>
+          )}
+        </div>
+
+        {item.is_premium && user?.tier === 'free' && (
+          <div className="mt-3 p-3 bg-gradient-to-r from-yellow-400/20 to-orange-500/20 border border-yellow-400/30 rounded-lg">
+            <p className="text-yellow-400 text-xs mb-2">Premium content - Subscribe to unlock</p>
+            <button
+              onClick={onSubscribe}
+              className="w-full py-1 bg-gradient-to-r from-yellow-400 to-orange-500 text-black text-xs font-bold rounded"
+            >
+              Subscribe Now
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
